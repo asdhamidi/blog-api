@@ -64,16 +64,25 @@ def create_post():
 @app.route('/post/<string:id>', methods=['PUT'])
 def update_post(id):
     post_data = request.json
-    post = posts_collection.find_one({'_id': ObjectId(id)}, {'_id': 1, 'title': 1, 'content': 1, 'author': 1, 'date': 1})
+    post_id = ObjectId(id)
+    post = posts_collection.find_one({'_id': post_id}, {'_id': 1, 'title': 1, 'content': 1, 'author': 1, 'date': 1})
     
+    if not post:
+        return jsonify({"message": "Post not found"}), 404
+
     updated_post = {
         "title": post_data.get("title", post['title']),
         "content": post_data.get("content", post['content']),
-        "date": datetime.datetime.now().strftime("%d-%m-%Y")  # or use `post['date']` to keep the original date
+        "date": datetime.datetime.now().strftime("%d-%m-%Y")
     }
-    posts_collection.update_one({"_id": id}, {"$set": updated_post})
 
-    return jsonify({"message": "Post created successfully", "post": updated_post}), 200
+    result = posts_collection.update_one({"_id": post_id}, {"$set": updated_post})
+
+    if result.matched_count == 0:
+        return jsonify({"message": "No post updated, it may not exist"}), 404
+
+    updated_post['_id'] = str(post_id)
+    return jsonify({"message": "Post updated successfully", "post": updated_post}), 200
 
 @app.route('/post/<string:id>', methods=['DELETE'])
 def delete_post(id):
