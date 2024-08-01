@@ -62,7 +62,7 @@ def create_post():
     return jsonify({"message": "Post created successfully", "post": new_post}), 201
 
 @app.route('/post/<string:id>', methods=['PUT'])
-def create_post(id):
+def update_post(id):
     post_data = request.json
     post = posts_collection.find_one({'_id': ObjectId(id)}, {'_id': 1, 'title': 1, 'content': 1, 'author': 1, 'date': 1})
     
