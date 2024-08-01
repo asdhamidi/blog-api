@@ -4,12 +4,14 @@ from bson.objectid import ObjectId
 import datetime
 import os
 from dotenv import load_dotenv
+from flask_cors import CORS 
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# Get environment variables
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
 mongodb_uri = os.getenv("MONGODB_URI")
 blog_db_name = os.getenv('BLOG_DB')
 
@@ -58,6 +60,20 @@ def create_post():
     new_post["_id"] = str(new_post["_id"])
     
     return jsonify({"message": "Post created successfully", "post": new_post}), 201
+
+@app.route('/post/<string:id>', methods=['PUT'])
+def create_post(id):
+    post_data = request.json
+    post = posts_collection.find_one({'_id': ObjectId(id)}, {'_id': 1, 'title': 1, 'content': 1, 'author': 1, 'date': 1})
+    
+    updated_post = {
+        "title": post_data.get("title", post['title']),
+        "content": post_data.get("content", post['content']),
+        "date": datetime.datetime.now().strftime("%d-%m-%Y")  # or use `post['date']` to keep the original date
+    }
+    posts_collection.update_one({"_id": id}, {"$set": updated_post})
+
+    return jsonify({"message": "Post created successfully", "post": updated_post}), 200
 
 @app.route('/post/<string:id>', methods=['DELETE'])
 def delete_post(id):
