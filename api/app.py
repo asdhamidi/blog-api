@@ -9,8 +9,16 @@ load_dotenv()
 
 app = Flask(__name__)
 
-client = MongoClient(os.getenv("MONGODB_URI"))
-db = client[os.getenv('BLOG_DB')] 
+# Get environment variables
+mongodb_uri = os.getenv("MONGODB_URI")
+blog_db_name = os.getenv('BLOG_DB')
+
+if not mongodb_uri or not blog_db_name:
+    raise ValueError("MONGODB_URI and BLOG_DB must be set in the environment variables.")
+
+# Connect to MongoDB
+client = MongoClient(mongodb_uri)
+db = client[blog_db_name] 
 posts_collection = db['posts']
 
 @app.route('/')
@@ -20,6 +28,8 @@ def home():
 @app.route('/posts', methods=['GET'])
 def get_posts():
     posts = list(posts_collection.find({}, {'_id': 1, 'title': 1, 'author': 1, 'date': 1})) 
+    for post in posts:
+        post['_id'] = str(post['_id'])  # Convert ObjectId to string
     return jsonify(posts)
 
 @app.route('/posts/<string:id>', methods=['GET'])
@@ -40,7 +50,7 @@ def create_post():
         "_id": ObjectId(),
         "title": post_data.get("title"),
         "content": post_data.get("content"),
-        "date": datetime.datetime.now().strftime("%d-%m-%Y"),  # Store date in the format you mentioned
+        "date": datetime.datetime.now().strftime("%d-%m-%Y"),
         "author": post_data.get("author")
     }
 
@@ -59,7 +69,6 @@ def delete_post(id):
         return jsonify({"message": "Post deleted successfully"})
     else:
         return jsonify({"message": "Post not found"}), 404
-
 
 if __name__ == '__main__':
     app.run(debug=True)
