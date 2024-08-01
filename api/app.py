@@ -10,7 +10,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 mongodb_uri = os.getenv("MONGODB_URI")
 blog_db_name = os.getenv('BLOG_DB')
