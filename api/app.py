@@ -76,7 +76,7 @@ def register():
         "_id": ObjectId(),
         "username": username,
         "password": hashed_password,
-        "created_at": datetime.datetime.now().strftime("%d-%m-%Y %I:%M %p")
+        "created_at": datetime.datetime.now().strftime("%B %-d, %Y - %I:%M %p")
     }
 
     users_collection.insert_one(new_user)
@@ -106,13 +106,12 @@ def generate_code():
     new_code = {
         "_id": ObjectId(),
         "code": str(random.randint(100000, 999999)),  # Generate a random 6-byte code
-        "created_at": datetime.datetime.now().strftime("%d-%m-%Y %I:%M %p")
+        "created_at": datetime.datetime.now().strftime("%B %-d, %Y - %I:%M %p")
     }
     codes_collection.insert_one(new_code)
     return jsonify({"message": "Registration code generated", "code": new_code["code"]}), 201
 
 @app.route('/posts', methods=['GET'])
-@token_required
 def get_posts():
     posts = list(posts_collection.find({}, {'_id': 1, 'title': 1, 'author': 1, 'date': 1})) 
     for post in posts:
@@ -120,7 +119,6 @@ def get_posts():
     return jsonify(posts)
 
 @app.route('/posts/<string:id>', methods=['GET'])
-@token_required
 def get_post_by_id(id):
     post = posts_collection.find_one({'_id': ObjectId(id)}, {'_id': 1, 'title': 1, 'content': 1, 'author': 1, 'date': 1})
     
@@ -139,7 +137,7 @@ def create_post():
         "_id": ObjectId(),
         "title": post_data.get("title"),
         "content": post_data.get("content"),
-        "date": datetime.datetime.now().strftime("%d-%m-%Y %I:%M %p"),
+        "date": datetime.datetime.now().strftime("%B %-d, %Y - %I:%M %p"),
         "author": post_data.get("author")
     }
 
@@ -161,7 +159,7 @@ def update_post(id):
     updated_post = {
         "title": post_data.get("title", post['title']),
         "content": post_data.get("content", post['content']),
-        "date": datetime.datetime.now().strftime("%d-%m-%Y %I:%M %p")
+        "date": datetime.datetime.now().strftime("%B %-d, %Y - %I:%M %p")
     }
 
     result = posts_collection.update_one({"_id": post_id}, {"$set": updated_post})
