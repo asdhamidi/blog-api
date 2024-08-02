@@ -4,3 +4,5 @@ flask-jwt-extended
 pymongo
 python-dotenv
 werkzeug
+Flask-JWT-Extended
+bcrypt
