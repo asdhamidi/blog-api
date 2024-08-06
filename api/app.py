@@ -87,7 +87,7 @@ def register():
         "_id": ObjectId(),
         "username": username,
         "password": hashed_password,
-        "created_at": datetime.datetime.now().strftime("%B %-d, %Y - %I:%M %p")
+        "created_at": datetime.datetime.now().strftime("%B %-d, %Y")
     }
 
     users_collection.insert_one(new_user)
@@ -104,7 +104,8 @@ def login():
 
     user = users_collection.find_one({"username": username})
     if user and bcrypt.checkpw(password.encode('utf-8'), user["password"]):
-        token = jwt.encode({"username": username, "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)}, jwt_secret, algorithm="HS256")
+        token = jwt.encode({"username": username, "exp": datetime.datetime.now() + datetime.timedelta(hours=24)}, jwt_secret, algorithm="HS256")
+        app.logger.info('%s logged in successfully', user.username)
         return jsonify({"message": "Login successful", "token": token}), 200
     else:
         return jsonify({"message": "Invalid username or password"}), 401
@@ -116,7 +117,7 @@ def generate_code():
     new_code = {
         "_id": ObjectId(),
         "code": str(random.randint(100000, 999999)),  # Generate a random 6-byte code
-        "created_at": datetime.datetime.now().strftime("%B %-d, %Y - %I:%M %p")
+        "created_at": datetime.datetime.now().strftime("%B %-d, %Y")
     }
     codes_collection.insert_one(new_code)
     return jsonify({"message": "Registration code generated", "code": new_code["code"]}), 201
@@ -150,7 +151,8 @@ def create_post():
         "_id": ObjectId(),
         "title": post_data.get("title"),
         "content": post_data.get("content"),
-        "date": datetime.datetime.now().strftime("%B %-d, %Y - %I:%M %p"),
+        "date": datetime.datetime.now().strftime("%B %-d, %Y"),
+        "updated": "",
         "author": post_data.get("author")
     }
 
@@ -172,7 +174,7 @@ def update_post(id):
     updated_post = {
         "title": post_data.get("title", post['title']),
         "content": post_data.get("content", post['content']),
-        "date": datetime.datetime.now().strftime("%B %-d, %Y - %I:%M %p")
+        "updated": datetime.datetime.now().strftime("%B %-d, %Y")
     }
 
     result = posts_collection.update_one({"_id": post_id}, {"$set": updated_post})
