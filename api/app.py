@@ -105,7 +105,7 @@ def login():
     user = users_collection.find_one({"username": username})
     if user and bcrypt.checkpw(password.encode('utf-8'), user["password"]):
         token = jwt.encode({"username": username, "exp": datetime.datetime.now() + datetime.timedelta(hours=24)}, jwt_secret, algorithm="HS256")
-        app.logger.log(user, ": Login")
+        print(username, " Logged in")
         return jsonify({"message": "Login successful", "token": token}), 200
     else:
         return jsonify({"message": "Invalid username or password"}), 401
