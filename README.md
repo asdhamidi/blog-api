@@ -1,6 +1,6 @@
 # Blog API
 
-This is a simple Flask API I created to manage my blog which is used on my portfolio website. The API provides functionality for user registration, login, and CRUD operations for blog posts. JWT authentication is used to secure certain endpoints.
+This is a Flask API designed to manage the blog on my portfolio website. It provides functionality for user registration, login, and CRUD operations for blog posts. JWT authentication is used to secure certain endpoints.
 
 ## Table of Contents
 
@@ -15,10 +15,11 @@ This is a simple Flask API I created to manage my blog which is used on my portf
 
 ## Features
 
-- User registration with password hashing and code verification
+- User registration with password hashing and registration code verification
 - User login with JWT token generation
-- Generate a registration code
+- Generate a registration code (for admin use)
 - CRUD operations for blog posts (Create, Read, Update, Delete)
+- Publish/unpublish posts functionality
 - Token-based authentication for protected routes
 
 ## Prerequisites
@@ -61,6 +62,17 @@ This is a simple Flask API I created to manage my blog which is used on my portf
 - `GET /` 
   - **Description**: Home route. Returns a welcome message.
 
+- `GET /posts`
+  - **Description**: Retrieves a list of all published posts.
+  - **Responses**:
+    - `200 OK`: Returns a list of published posts.
+
+- `GET /posts/<id>`
+  - **Description**: Retrieves a specific published post by ID.
+  - **Responses**:
+    - `200 OK`: Returns the requested post.
+    - `404 Not Found`: Post not found.
+
 ### Authentication Endpoints
 
 - `POST /register`
@@ -86,19 +98,11 @@ This is a simple Flask API I created to manage my blog which is used on my portf
     - `201 Created`: Registration code generated.
     - `401 Unauthorized`: Token is missing or invalid.
 
-- `GET /posts`
+- `GET /posts-all`
   - **Headers**: `Authorization: Bearer <token>`
-  - **Description**: Retrieves a list of all posts.
+  - **Description**: Retrieves a list of all posts, both published and unpublished.
   - **Responses**:
     - `200 OK`: Returns a list of posts.
-    - `401 Unauthorized`: Token is missing or invalid.
-
-- `GET /posts/<id>`
-  - **Headers**: `Authorization: Bearer <token>`
-  - **Description**: Retrieves a specific post by ID.
-  - **Responses**:
-    - `200 OK`: Returns the requested post.
-    - `404 Not Found`: Post not found.
     - `401 Unauthorized`: Token is missing or invalid.
 
 - `POST /posts`
@@ -115,6 +119,22 @@ This is a simple Flask API I created to manage my blog which is used on my portf
   - **Description**: Updates a post by ID.
   - **Responses**:
     - `200 OK`: Post updated successfully.
+    - `404 Not Found`: Post not found.
+    - `401 Unauthorized`: Token is missing or invalid.
+
+- `PUT /posts/<id>/unpublish`
+  - **Headers**: `Authorization: Bearer <token>`
+  - **Description**: Unpublishes a post by ID.
+  - **Responses**:
+    - `200 OK`: Post unpublished successfully.
+    - `404 Not Found`: Post not found.
+    - `401 Unauthorized`: Token is missing or invalid.
+
+- `PUT /posts/<id>/publish`
+  - **Headers**: `Authorization: Bearer <token>`
+  - **Description**: Publishes a previously unpublished post by ID.
+  - **Responses**:
+    - `200 OK`: Post published successfully.
     - `404 Not Found`: Post not found.
     - `401 Unauthorized`: Token is missing or invalid.
 
@@ -160,4 +180,4 @@ This project uses several key Python modules. Here’s a list of the major ones 
 
 ## License
 
-This project is licensed under... I don't know which license. Use it, don't use it, I couldn't care less.
+This project is licensed under... well, no specific license. Feel free to use it however you like. Consider it public domain—use it, modify it, share it, or just ignore it.
