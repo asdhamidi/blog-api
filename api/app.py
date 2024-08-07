@@ -126,7 +126,7 @@ def generate_code():
 # Public endpoints
 @app.route('/posts', methods=['GET'])
 def get_posts():
-    posts = list(posts_collection.find({}, {'_id': 1, 'title': 1, 'author': 1, 'date': 1})) 
+    posts = list(posts_collection.find({'published': "true"}, {'_id': 1, 'title': 1, 'author': 1, 'date': 1})) 
     for post in posts:
         post['_id'] = str(post['_id']) 
     return jsonify(posts)
@@ -142,6 +142,14 @@ def get_post_by_id(id):
         return jsonify({"message": "Post not found"}), 404
 
 # Protected endpoints
+@app.route('/posts-all', methods=['GET'])
+@token_required
+def get_posts_all():
+    posts = list(posts_collection.find({}, {'_id': 1, 'title': 1, 'author': 1, 'date': 1, 'published': 1, 'update': 1})) 
+    for post in posts:
+        post['_id'] = str(post['_id']) 
+    return jsonify(posts)
+
 @app.route('/posts', methods=['POST'])
 @token_required
 def create_post():
@@ -153,6 +161,7 @@ def create_post():
         "content": post_data.get("content"),
         "date": datetime.datetime.now().strftime("%B %-d, %Y"),
         "updated": "",
+        "published": "true",
         "author": post_data.get("author")
     }
 
@@ -160,6 +169,48 @@ def create_post():
     new_post["_id"] = str(new_post["_id"])
     
     return jsonify({"message": "Post created successfully", "post": new_post}), 201
+
+@app.route('/posts/<string:id>/unpublish', methods=['PUT'])
+@token_required
+def unpublish_post(id):
+    post_id = ObjectId(id)
+    post = posts_collection.find_one({'_id': post_id}, {'_id': 1, 'title': 1, 'content': 1, 'author': 1, 'date': 1})
+    
+    if not post:
+        return jsonify({"message": "Post not found"}), 404
+
+    updated_post = {
+        "published": "false"
+    }
+
+    result = posts_collection.update_one({"_id": post_id}, {"$set": updated_post})
+
+    if result.matched_count == 0:
+        return jsonify({"message": "No post unpublished, it may not exist"}), 404
+
+    updated_post['_id'] = str(post_id)
+    return jsonify({"message": "Post unpublished successfully", "post": updated_post}), 200
+
+@app.route('/posts/<string:id>/publish', methods=['PUT'])
+@token_required
+def publish_post(id):
+    post_id = ObjectId(id)
+    post = posts_collection.find_one({'_id': post_id}, {'_id': 1, 'title': 1, 'content': 1, 'author': 1, 'date': 1})
+    
+    if not post:
+        return jsonify({"message": "Post not found"}), 404
+
+    updated_post = {
+        "published": "true"
+    }
+
+    result = posts_collection.update_one({"_id": post_id}, {"$set": updated_post})
+
+    if result.matched_count == 0:
+        return jsonify({"message": "No post published, it may not exist"}), 404
+
+    updated_post['_id'] = str(post_id)
+    return jsonify({"message": "Post published successfully", "post": updated_post}), 200
 
 @app.route('/posts/<string:id>', methods=['PUT'])
 @token_required
