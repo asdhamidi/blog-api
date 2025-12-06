@@ -46,74 +46,195 @@ def home():
 
 @app.route('/visit', methods=['GET'])
 def add_visit():
-    # For GET requests, get data from query parameters instead of JSON body
-    post_data = dict(request.args)  # Use query params instead of JSON
-    
-    # Get headers and other request information
-    headers = dict(request.headers)
-    
-    new_visit = {
-        # Request body data (from query params for GET)
-        **post_data,
+    try:
+        post_data = dict(request.args)  # Use query params instead of JSON
+        headers = dict(request.headers)
         
-        # Request metadata
-        'request_metadata': {
-            'method': request.method,
-            'url': request.url,
-            'base_url': request.base_url,
-            'host': request.host,
-            'host_url': request.host_url,
-            'path': request.path,
-            'full_path': request.full_path,
-            'endpoint': request.endpoint,
-            'remote_addr': request.remote_addr,
-            'scheme': request.scheme,
-            'is_secure': request.is_secure,
-            'content_type': request.content_type,
-            'content_length': request.content_length,
-            'content_encoding': request.content_encoding,
-            'mimetype': request.mimetype,
-            'mimetype_params': request.mimetype_params,
-            'date': request.date.isoformat() if request.date else None,
-            'headers': headers,
-            'user_agent': headers.get('User-Agent'),
-            'referrer': request.referrer,
-            'origin': headers.get('Origin'),
-            'authorization': 'present' if 'Authorization' in headers else None,
-        },
+        # Extract meaningful information
+        user_agent = headers.get('User-Agent', '')
+        referrer = request.referrer or 'Direct'
+        ip_address = request.remote_addr
         
-        # Timestamps
-        'timestamp': datetime.datetime.utcnow(),
-        'server_timestamp': datetime.datetime.utcnow().isoformat(),
+        # Parse User-Agent for device/browser info
+        device_type = 'Unknown'
+        browser = 'Unknown'
+        os = 'Unknown'
         
-        # Query parameters
-        'query_params': dict(request.args),
+        if user_agent:
+            # Simple user agent parsing (consider using a library like user-agents for production)
+            ua_lower = user_agent.lower()
+            
+            # Device detection
+            if any(mobile in ua_lower for mobile in ['mobile', 'android', 'iphone']):
+                device_type = 'Mobile'
+            elif 'tablet' in ua_lower:
+                device_type = 'Tablet'
+            else:
+                device_type = 'Desktop'
+            
+            # Browser detection
+            if 'chrome' in ua_lower and 'edg' not in ua_lower:
+                browser = 'Chrome'
+            elif 'firefox' in ua_lower:
+                browser = 'Firefox'
+            elif 'safari' in ua_lower and 'chrome' not in ua_lower:
+                browser = 'Safari'
+            elif 'edg' in ua_lower:
+                browser = 'Edge'
+            elif 'opera' in ua_lower:
+                browser = 'Opera'
+            
+            # OS detection
+            if 'windows' in ua_lower:
+                os = 'Windows'
+            elif 'mac os' in ua_lower or 'macos' in ua_lower:
+                os = 'macOS'
+            elif 'linux' in ua_lower:
+                os = 'Linux'
+            elif 'android' in ua_lower:
+                os = 'Android'
+            elif 'ios' in ua_lower or 'iphone' in ua_lower:
+                os = 'iOS'
         
-        # Form data (if any)
-        'form_data': dict(request.form),
+        # Parse referrer for source tracking
+        referrer_source = 'Direct'
+        referrer_domain = None
         
-        # Files (if any)
-        'files': list(request.files.keys()) if request.files else None,
+        if referrer and referrer != 'Direct':
+            try:
+                from urllib.parse import urlparse
+                parsed_url = urlparse(referrer)
+                referrer_domain = parsed_url.netloc
+                
+                # Common source classification
+                if any(domain in referrer_domain for domain in ['google.', 'bing.', 'yahoo.', 'duckduckgo.']):
+                    referrer_source = 'Search Engine'
+                elif 'facebook.com' in referrer_domain:
+                    referrer_source = 'Facebook'
+                elif 'twitter.com' in referrer_domain or 'x.com' in referrer_domain:
+                    referrer_source = 'Twitter'
+                elif 'linkedin.com' in referrer_domain:
+                    referrer_source = 'LinkedIn'
+                elif 'github.com' in referrer_domain:
+                    referrer_source = 'GitHub'
+                elif 'youtube.com' in referrer_domain:
+                    referrer_source = 'YouTube'
+                elif 'reddit.com' in referrer_domain:
+                    referrer_source = 'Reddit'
+                else:
+                    referrer_source = 'Referral'
+            except:
+                referrer_source = 'Referral'
         
-        # Cookies
-        'cookies': dict(request.cookies),
+        # Get page/section from custom data or URL
+        page = post_data.get('page') or request.path
+        action = post_data.get('action', 'pageview')
         
-        # Authentication info
-        'auth': {
-            'authenticated': request.authorization is not None,
-            'username': request.authorization.username if request.authorization else None,
-            'password_present': bool(request.authorization and request.authorization.password)
+        # Get screen dimensions if available
+        screen_width = post_data.get('screen_width')
+        screen_height = post_data.get('screen_height')
+        
+        # Get session info
+        session_id = post_data.get('session_id')
+        
+        # Create enriched visit document
+        now = datetime.datetime.utcnow()
+        
+        new_visit = {
+            # Basic request data
+            **post_data,
+            
+            # Analytics metadata
+            'analytics': {
+                'session_id': session_id,
+                'page': page,
+                'action': action,
+                'timestamp': now.isoformat(),
+                'date': now.strftime("%Y-%m-%d"),
+                'time': now.strftime("%H:%M:%S"),
+                'day_of_week': now.strftime("%A"),
+                'hour': now.hour,
+                'month': now.strftime("%B"),
+                'year': now.year,
+            },
+            
+            # Visitor information
+            'visitor': {
+                'ip_address': ip_address,
+                'device': {
+                    'type': device_type,
+                    'browser': browser,
+                    'operating_system': os,
+                    'user_agent': user_agent[:200] if user_agent else None,  # Truncate if too long
+                    'screen_width': screen_width,
+                    'screen_height': screen_height,
+                },
+                'language': headers.get('Accept-Language', '').split(',')[0] if headers.get('Accept-Language') else None,
+            },
+            
+            # Traffic source
+            'traffic_source': {
+                'referrer': referrer,
+                'referrer_domain': referrer_domain,
+                'source': referrer_source,
+                'utm_source': request.args.get('utm_source'),
+                'utm_medium': request.args.get('utm_medium'),
+                'utm_campaign': request.args.get('utm_campaign'),
+                'utm_content': request.args.get('utm_content'),
+                'utm_term': request.args.get('utm_term'),
+            },
+            
+            # Engagement metrics (you can update these later)
+            'engagement': {
+                'time_on_page': post_data.get('time_on_page'),
+                'scroll_depth': post_data.get('scroll_depth'),
+                'clicks': post_data.get('clicks', 0),
+                'is_bounce': True,  # Default to bounce, update if subsequent actions
+                'first_visit': True,  # You'd track this via cookies/sessions
+            },
+            
+            # Request metadata
+            'request_metadata': {
+                'method': request.method,
+                'url': request.url,
+                'path': request.path,
+                'query_params': dict(request.args),
+                'content_type': request.content_type,
+                'content_length': request.content_length,
+                'is_secure': request.is_secure,
+                'headers_summary': {
+                    'user_agent': bool(user_agent),
+                    'accept_encoding': headers.get('Accept-Encoding'),
+                    'accept_language': headers.get('Accept-Language'),
+                    'connection': headers.get('Connection'),
+                    'cache_control': headers.get('Cache-Control'),
+                }
+            },
+            
+            # System timestamps
+            'timestamp': now,
+            'server_timestamp': now.isoformat(),
         }
-    }
-    
-    # Insert into MongoDB collection
-    visits_collection.insert_one(new_visit)
-    
-    return jsonify({
-        'message': 'Visit recorded successfully',
-        'visit_id': str(new_visit.get('_id')) if '_id' in new_visit else None,
-        'timestamp': new_visit['timestamp']
-    }), 201
+        
+        # Insert into MongoDB collection
+        result = visits_collection.insert_one(new_visit)
+        visit_id = str(result.inserted_id)
+        
+        # Return success response with minimal data
+        return jsonify({
+            'success': True,
+            'message': 'Visit recorded successfully',
+            'visit_id': visit_id,
+            'timestamp': now.isoformat()
+        }), 201
+        
+    except Exception as e:
+        # Log the error but don't expose details to client
+        print(f"Error recording visit: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to record visit'
+        }), 500
 
 
 # Decorator for route protection.
