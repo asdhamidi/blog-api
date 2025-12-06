@@ -44,7 +44,7 @@ def home():
     Happy trails!
     """
 
-@app.route('/visit', methods=['POST'])
+@app.route('/visit')
 def add_visit():
     # Get all possible data from the request
     post_data = request.json
