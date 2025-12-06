@@ -236,7 +236,229 @@ def add_visit():
             'message': 'Failed to record visit'
         }), 500
 
-
+@app.route('/visits/insights', methods=['GET'])
+def get_visits_insights():
+    try:
+        # Get time filter from query parameters (optional)
+        days = int(request.args.get('days', 7))
+        
+        # Calculate date threshold
+        cutoff_date = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+        
+        # Build insights
+        insights = {
+            'summary': {},
+            'traffic_sources': {},
+            'devices': {},
+            'pages': {},
+            'engagement': {},
+            'timeline': {}
+        }
+        
+        # 1. BASIC SUMMARY METRICS
+        total_visits = visits_collection.count_documents({})
+        recent_visits = visits_collection.count_documents({'timestamp': {'$gte': cutoff_date}})
+        
+        unique_ips_pipeline = [
+            {'$group': {'_id': '$visitor.ip_address'}},
+            {'$count': 'unique_visitors'}
+        ]
+        unique_ips_result = list(visits_collection.aggregate(unique_ips_pipeline))
+        unique_visitors = unique_ips_result[0]['unique_visitors'] if unique_ips_result else 0
+        
+        # Get bounce rate (single page visits)
+        bounce_pipeline = [
+            {'$match': {'engagement.is_bounce': True}},
+            {'$count': 'bounces'}
+        ]
+        bounce_result = list(visits_collection.aggregate(bounce_pipeline))
+        bounces = bounce_result[0]['bounces'] if bounce_result else 0
+        bounce_rate = (bounces / total_visits * 100) if total_visits > 0 else 0
+        
+        insights['summary'] = {
+            'total_visits': total_visits,
+            'recent_visits': recent_visits,
+            'unique_visitors': unique_visitors,
+            'avg_visits_per_day': round(recent_visits / days, 2) if days > 0 else 0,
+            'bounce_rate': round(bounce_rate, 2)
+        }
+        
+        # 2. TRAFFIC SOURCES
+        traffic_pipeline = [
+            {'$group': {
+                '_id': '$traffic_source.source',
+                'count': {'$sum': 1},
+                'avg_time': {'$avg': '$engagement.time_on_page'}
+            }},
+            {'$sort': {'count': -1}},
+            {'$limit': 10}
+        ]
+        
+        traffic_results = list(visits_collection.aggregate(traffic_pipeline))
+        insights['traffic_sources'] = {
+            'by_source': [
+                {'source': item['_id'], 'count': item['count'], 'avg_time': round(item['avg_time'] or 0, 2)}
+                for item in traffic_results
+            ],
+            'top_referrers': list(visits_collection.find(
+                {'traffic_source.referrer_domain': {'$ne': None}},
+                {'traffic_source.referrer_domain': 1, '_id': 0}
+            ).distinct('traffic_source.referrer_domain')[:10])
+        }
+        
+        # 3. DEVICE & BROWSER INSIGHTS
+        device_pipeline = [
+            {'$group': {
+                '_id': '$visitor.device.type',
+                'count': {'$sum': 1},
+                'percentage': {'$avg': 1}
+            }},
+            {'$sort': {'count': -1}}
+        ]
+        
+        device_results = list(visits_collection.aggregate(device_pipeline))
+        insights['devices'] = {
+            'by_type': [
+                {'device': item['_id'], 'count': item['count'], 'percentage': round(item['percentage'] * 100, 2)}
+                for item in device_results
+            ],
+            'browsers': list(visits_collection.find(
+                {'visitor.device.browser': {'$ne': None}},
+                {'visitor.device.browser': 1, '_id': 0}
+            ).distinct('visitor.device.browser')[:5]),
+            'operating_systems': list(visits_collection.find(
+                {'visitor.device.operating_system': {'$ne': None}},
+                {'visitor.device.operating_system': 1, '_id': 0}
+            ).distinct('visitor.device.operating_system')[:5])
+        }
+        
+        # 4. MOST POPULAR PAGES
+        pages_pipeline = [
+            {'$group': {
+                '_id': '$analytics.page',
+                'count': {'$sum': 1},
+                'avg_time': {'$avg': '$engagement.time_on_page'},
+                'bounce_rate': {
+                    '$avg': {'$cond': [{'$eq': ['$engagement.is_bounce', True]}, 1, 0]}
+                }
+            }},
+            {'$sort': {'count': -1}},
+            {'$limit': 10}
+        ]
+        
+        pages_results = list(visits_collection.aggregate(pages_pipeline))
+        insights['pages'] = {
+            'most_visited': [
+                {
+                    'page': item['_id'],
+                    'visits': item['count'],
+                    'avg_time_seconds': round(item['avg_time'] or 0, 2),
+                    'bounce_rate_percent': round((item['bounce_rate'] or 0) * 100, 2)
+                }
+                for item in pages_results
+            ]
+        }
+        
+        # 5. ENGAGEMENT METRICS
+        scroll_pipeline = [
+            {'$match': {'engagement.scroll_depth': {'$exists': True}}},
+            {'$group': {
+                '_id': None,
+                'avg_scroll_depth': {'$avg': '$engagement.scroll_depth'},
+                'max_scroll_depth': {'$max': '$engagement.scroll_depth'},
+                'scrolled_users': {'$sum': 1}
+            }}
+        ]
+        
+        scroll_result = list(visits_collection.aggregate(scroll_pipeline))
+        scroll_data = scroll_result[0] if scroll_result else {}
+        
+        insights['engagement'] = {
+            'avg_scroll_depth': round(scroll_data.get('avg_scroll_depth', 0), 2),
+            'max_scroll_depth': scroll_data.get('max_scroll_depth', 0),
+            'users_who_scrolled': scroll_data.get('scrolled_users', 0),
+            'total_clicks': visits_collection.count_documents({'action': 'click'}),
+            'total_downloads': visits_collection.count_documents({'action': 'download'}),
+            'avg_time_on_page': round(visits_collection.aggregate([
+                {'$match': {'engagement.time_on_page': {'$exists': True, '$ne': None}}},
+                {'$group': {'_id': None, 'avg': {'$avg': '$engagement.time_on_page'}}}
+            ]).next().get('avg', 0) if visits_collection.count_documents({'engagement.time_on_page': {'$exists': True}}) > 0 else 0, 2)
+        }
+        
+        # 6. TIMELINE DATA (last 30 days)
+        if days <= 30:  # Only return timeline for reasonable timeframes
+            timeline_pipeline = [
+                {'$match': {'timestamp': {'$gte': cutoff_date}}},
+                {'$group': {
+                    '_id': {'$dateToString': {'format': '%Y-%m-%d', 'date': '$timestamp'}},
+                    'visits': {'$sum': 1},
+                    'unique_visitors': {'$addToSet': '$visitor.ip_address'}
+                }},
+                {'$project': {
+                    'date': '$_id',
+                    'visits': 1,
+                    'unique_visitors': {'$size': '$unique_visitors'}
+                }},
+                {'$sort': {'date': 1}}
+            ]
+            
+            timeline_results = list(visits_collection.aggregate(timeline_pipeline))
+            insights['timeline'] = {
+                'daily_visits': timeline_results,
+                'period': f'last_{days}_days'
+            }
+        
+        # 7. PEAK HOURS
+        hour_pipeline = [
+            {'$group': {
+                '_id': '$analytics.hour',
+                'count': {'$sum': 1}
+            }},
+            {'$sort': {'count': -1}},
+            {'$limit': 5}
+        ]
+        
+        hour_results = list(visits_collection.aggregate(hour_pipeline))
+        insights['peak_hours'] = [
+            {'hour': f"{item['_id']}:00", 'visits': item['count']}
+            for item in hour_results
+        ]
+        
+        # 8. RECENT ACTIVITY
+        recent_activity = list(visits_collection.find(
+            {},
+            {
+                'analytics.timestamp': 1,
+                'analytics.page': 1,
+                'visitor.device.type': 1,
+                'visitor.device.browser': 1,
+                'traffic_source.source': 1,
+                'action': 1
+            }
+        ).sort('timestamp', -1).limit(10))
+        
+        # Convert ObjectId to string for JSON serialization
+        for activity in recent_activity:
+            activity['_id'] = str(activity['_id'])
+        
+        insights['recent_activity'] = recent_activity
+        
+        return jsonify({
+            'success': True,
+            'insights': insights,
+            'generated_at': datetime.datetime.utcnow().isoformat(),
+            'time_period': f'Last {days} days',
+            'total_records_analyzed': total_visits
+        }), 200
+        
+    except Exception as e:
+        print(f"Error generating insights: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Failed to generate insights',
+            'message': str(e)
+        }), 500
+        
 # Decorator for route protection.
 def token_required(f):
     @wraps(f)
