@@ -29,6 +29,8 @@ db = client[blog_db_name]
 posts_collection = db['posts']
 users_collection = db['users']
 codes_collection = db['codes']
+visits_collection = db['visits']
+
 
 # Home route.
 @app.route('/')
@@ -41,6 +43,78 @@ def home():
 
     Happy trails!
     """
+
+@app.route('/visit', methods=['POST'])
+def add_visit():
+    # Get all possible data from the request
+    post_data = request.json
+    
+    # Get headers and other request information
+    headers = dict(request.headers)
+    
+    new_visit = {
+        # Request body data
+        **post_data,
+        
+        # Request metadata
+        'request_metadata': {
+            'method': request.method,
+            'url': request.url,
+            'base_url': request.base_url,
+            'host': request.host,
+            'host_url': request.host_url,
+            'path': request.path,
+            'full_path': request.full_path,
+            'endpoint': request.endpoint,
+            'remote_addr': request.remote_addr,
+            'scheme': request.scheme,
+            'is_secure': request.is_secure,
+            'content_type': request.content_type,
+            'content_length': request.content_length,
+            'content_encoding': request.content_encoding,
+            'mimetype': request.mimetype,
+            'mimetype_params': request.mimetype_params,
+            'date': request.date.isoformat() if request.date else None,
+            'headers': headers,
+            'user_agent': headers.get('User-Agent'),
+            'referrer': request.referrer,
+            'origin': headers.get('Origin'),
+            'authorization': 'present' if 'Authorization' in headers else None,
+        },
+        
+        # Timestamps
+        'timestamp': datetime.datetime.utcnow(),
+        'server_timestamp': datetime.datetime.utcnow().isoformat(),
+        
+        # Query parameters
+        'query_params': dict(request.args),
+        
+        # Form data (if any)
+        'form_data': dict(request.form),
+        
+        # Files (if any)
+        'files': list(request.files.keys()) if request.files else None,
+        
+        # Cookies
+        'cookies': dict(request.cookies),
+        
+        # Authentication info
+        'auth': {
+            'authenticated': request.authorization is not None,
+            'username': request.authorization.username if request.authorization else None,
+            'password_present': bool(request.authorization and request.authorization.password)
+        }
+    }
+    
+    # Insert into MongoDB collection
+    visits_collection.insert_one(new_visit)
+    
+    return jsonify({
+        'message': 'Visit recorded successfully',
+        'visit_id': str(new_visit.get('_id')) if '_id' in new_visit else None,
+        'timestamp': new_visit['timestamp']
+    }), 201
+
 
 # Decorator for route protection.
 def token_required(f):
