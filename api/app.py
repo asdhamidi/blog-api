@@ -46,14 +46,14 @@ def home():
 
 @app.route('/visit', methods=['GET'])
 def add_visit():
-    # Get all possible data from the request
-    post_data = request.json
+    # For GET requests, get data from query parameters instead of JSON body
+    post_data = dict(request.args)  # Use query params instead of JSON
     
     # Get headers and other request information
     headers = dict(request.headers)
     
     new_visit = {
-        # Request body data
+        # Request body data (from query params for GET)
         **post_data,
         
         # Request metadata
