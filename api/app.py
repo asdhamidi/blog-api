@@ -10,6 +10,25 @@ import random
 import jwt
 import os
 
+# New imports for enhanced visit handling
+from threading import Thread
+from user_agents import parse as parse_ua
+from urllib.parse import urlparse
+import hashlib
+
+# Optional geoip support (local MaxMind DB) and external fallback
+try:
+    import geoip2.database
+    GEOIP_READER = geoip2.database.Reader(os.getenv("GEOIP2_DB_PATH", "/usr/local/share/GeoLite2-City.mmdb"))
+except Exception:
+    GEOIP_READER = None
+
+# optional requests for external IP info lookup
+try:
+    import requests
+except Exception:
+    requests = None
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -31,6 +50,18 @@ users_collection = db['users']
 codes_collection = db['codes']
 visits_collection = db['visits']
 
+# Ensure useful indexes for the enhanced schema (idempotent)
+try:
+    visits_collection.create_index([('received_at', -1)])
+    visits_collection.create_index([('analytics.page', 1)])
+    visits_collection.create_index([('client.referrer_domain', 1)])
+    visits_collection.create_index([('client.ip_geo.country', 1)])
+    visits_collection.create_index([('analytics.session_id', 1)])
+    # Example TTL: keep raw visit docs for 90 days (customize as needed)
+    # visits_collection.create_index('received_at', expireAfterSeconds=60*60*24*90)
+except Exception as e:
+    print("Could not create indexes on visits collection:", e)
+
 
 # Home route.
 @app.route('/')
@@ -44,212 +75,259 @@ def home():
     Happy trails!
     """
 
-@app.route('/visit', methods=['GET'])
-def add_visit():
+
+# --- Helpers for enhanced visit collection ---
+MAX_UA_LEN = 512
+MAX_REFERRER_LEN = 256
+MAX_FIELD_LEN = 1024
+IPINFO_TOKEN = os.getenv('IPINFO_TOKEN')
+
+
+def _sanitize_keys(d):
+    """Remove keys with dots or starting with $ (MongoDB operators) and truncate long strings."""
+    safe = {}
+    if not d:
+        return safe
+    for k, v in d.items():
+        if not isinstance(k, str):
+            continue
+        if '.' in k or k.startswith('$'):
+            continue
+        if isinstance(v, str) and len(v) > MAX_FIELD_LEN:
+            safe[k] = v[:MAX_FIELD_LEN]
+        else:
+            safe[k] = v
+    return safe
+
+
+def _get_client_ip(headers):
+    # Respect common proxy headers; take first IP in X-Forwarded-For
+    xff = headers.get('X-Forwarded-For') or headers.get('x-forwarded-for')
+    if xff:
+        return xff.split(',')[0].strip()
+    xrip = headers.get('X-Real-IP') or headers.get('x-real-ip')
+    if xrip:
+        return xrip.strip()
+    return request.remote_addr
+
+
+def _hash_ip(ip, salt=None):
+    if not ip:
+        return None
+    h = hashlib.sha256()
+    if salt:
+        h.update(salt.encode('utf-8'))
+    h.update(ip.encode('utf-8'))
+    return h.hexdigest()
+
+
+def _geo_lookup(ip):
     try:
-        post_data = dict(request.args)  # Use query params instead of JSON
-        headers = dict(request.headers)
-        
-        # Extract meaningful information
-        user_agent = headers.get('User-Agent', '')
-        referrer = request.referrer or 'Direct'
-        ip_address = request.remote_addr
-        
-        # Parse User-Agent for device/browser info
-        device_type = 'Unknown'
-        browser = 'Unknown'
-        os = 'Unknown'
-        
-        if user_agent:
-            # Simple user agent parsing (consider using a library like user-agents for production)
-            ua_lower = user_agent.lower()
-            
-            # Device detection
-            if any(mobile in ua_lower for mobile in ['mobile', 'android', 'iphone']):
-                device_type = 'Mobile'
-            elif 'tablet' in ua_lower:
-                device_type = 'Tablet'
-            else:
-                device_type = 'Desktop'
-            
-            # Browser detection
-            if 'chrome' in ua_lower and 'edg' not in ua_lower:
-                browser = 'Chrome'
-            elif 'firefox' in ua_lower:
-                browser = 'Firefox'
-            elif 'safari' in ua_lower and 'chrome' not in ua_lower:
-                browser = 'Safari'
-            elif 'edg' in ua_lower:
-                browser = 'Edge'
-            elif 'opera' in ua_lower:
-                browser = 'Opera'
-            
-            # OS detection
-            if 'windows' in ua_lower:
-                os = 'Windows'
-            elif 'mac os' in ua_lower or 'macos' in ua_lower:
-                os = 'macOS'
-            elif 'linux' in ua_lower:
-                os = 'Linux'
-            elif 'android' in ua_lower:
-                os = 'Android'
-            elif 'ios' in ua_lower or 'iphone' in ua_lower:
-                os = 'iOS'
-        
-        # Parse referrer for source tracking
-        referrer_source = 'Direct'
-        referrer_domain = None
-        
-        if referrer and referrer != 'Direct':
+        if not ip:
+            return None
+        if GEOIP_READER:
+            r = GEOIP_READER.city(ip)
+            return {
+                'country': r.country.name,
+                'country_iso': r.country.iso_code,
+                'region': r.subdivisions.most_specific.name,
+                'city': r.city.name,
+                'latitude': r.location.latitude,
+                'longitude': r.location.longitude,
+                'timezone': r.location.time_zone,
+                'postal': r.postal.code,
+            }
+        elif IPINFO_TOKEN and requests:
+            resp = requests.get(f'https://ipinfo.io/{ip}/json?token={IPINFO_TOKEN}', timeout=2)
+            if resp.status_code == 200:
+                j = resp.json()
+                loc = j.get('loc', '')
+                lat, lon = (loc.split(',') + [None, None])[:2]
+                return {
+                    'country': j.get('country'),
+                    'region': j.get('region'),
+                    'city': j.get('city'),
+                    'latitude': float(lat) if lat else None,
+                    'longitude': float(lon) if lon else None,
+                    'timezone': j.get('timezone'),
+                    'postal': j.get('postal'),
+                    'org': j.get('org')
+                }
+    except Exception:
+        pass
+    return None
+
+
+def _insert_visit_async(doc):
+    def _worker(d):
+        try:
+            visits_collection.insert_one(d)
+        except Exception as e:
+            print("visit insert failed:", e)
+    Thread(target=_worker, args=(doc,), daemon=True).start()
+
+
+@app.route('/visit', methods=['POST', 'GET'])
+def add_visit():
+    """Enhanced visit endpoint: prefers POST JSON but accepts GET query params for backward compatibility.
+    Extracts client hints, performance metrics, geo info (optional), UA-parsed details, and stores a privacy-aware doc.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        if not body:
+            body = {k: v for k, v in request.args.items()}
+        body = _sanitize_keys(body)
+
+        headers = {k: v for k, v in request.headers.items()}
+        ip = _get_client_ip(request.headers)
+        hashed_ip = _hash_ip(ip, salt=os.getenv("IP_HASH_SALT", ""))
+
+        ua_string = headers.get('User-Agent', '') or ''
+        ua_string_trunc = ua_string[:MAX_UA_LEN]
+        ua = parse_ua(ua_string) if ua_string else None
+
+        ua_data = {
+            'user_agent': ua_string_trunc,
+            'browser_family': ua.browser.family if ua else None,
+            'browser_version': '.'.join([p for p in ua.browser.version if p]) if ua and ua.browser.version else None,
+            'os_family': ua.os.family if ua else None,
+            'os_version': '.'.join([p for p in ua.os.version if p]) if ua and ua.os.version else None,
+            'device_family': ua.device.family if ua else None,
+            'is_mobile': ua.is_mobile if ua else False,
+            'is_tablet': ua.is_tablet if ua else False,
+            'is_pc': ua.is_pc if ua else False,
+            'is_bot': ua.is_bot if ua else False,
+        }
+
+        client_hints = {
+            'sec_ch_ua': headers.get('Sec-CH-UA'),
+            'sec_ch_ua_mobile': headers.get('Sec-CH-UA-Mobile'),
+            'sec_ch_ua_platform': headers.get('Sec-CH-UA-Platform'),
+            'dpr': headers.get('DPR'),
+            'viewport_width': headers.get('Viewport-Width') or body.get('viewport_width'),
+            'width': headers.get('Width') or body.get('width'),
+            'save_data': headers.get('Save-Data') or body.get('save_data'),
+        }
+
+        perf = {
+            'page_load_time': body.get('page_load_time'),
+            'dom_content_loaded': body.get('dom_content_loaded'),
+            'first_paint': body.get('first_paint'),
+            'first_contentful_paint': body.get('first_contentful_paint'),
+            'largest_contentful_paint': body.get('largest_contentful_paint'),
+            'cumulative_layout_shift': body.get('cumulative_layout_shift'),
+            'total_blocking_time': body.get('total_blocking_time'),
+        }
+
+        utm = {
+            'utm_source': request.args.get('utm_source') or body.get('utm_source'),
+            'utm_medium': request.args.get('utm_medium') or body.get('utm_medium'),
+            'utm_campaign': request.args.get('utm_campaign') or body.get('utm_campaign'),
+            'utm_term': request.args.get('utm_term') or body.get('utm_term'),
+            'utm_content': request.args.get('utm_content') or body.get('utm_content'),
+        }
+
+        referrer = body.get('referrer') or request.referrer or headers.get('Referer') or None
+        referrer = referrer[:MAX_REFERRER_LEN] if referrer else None
+        ref_domain = urlparse(referrer).netloc if referrer else None
+
+        event = {
+            'type': body.get('event_type', body.get('action', 'pageview')),
+            'element_id': body.get('element_id'),
+            'element_selector': body.get('element_selector'),
+            'link_url': body.get('link_url'),
+            'link_text': body.get('link_text'),
+        }
+
+        def _to_int(v):
             try:
-                from urllib.parse import urlparse
-                parsed_url = urlparse(referrer)
-                referrer_domain = parsed_url.netloc
-                
-                # Common source classification
-                if any(domain in referrer_domain for domain in ['google.', 'bing.', 'yahoo.', 'duckduckgo.']):
-                    referrer_source = 'Search Engine'
-                elif 'facebook.com' in referrer_domain:
-                    referrer_source = 'Facebook'
-                elif 'twitter.com' in referrer_domain or 'x.com' in referrer_domain:
-                    referrer_source = 'Twitter'
-                elif 'linkedin.com' in referrer_domain:
-                    referrer_source = 'LinkedIn'
-                elif 'github.com' in referrer_domain:
-                    referrer_source = 'GitHub'
-                elif 'youtube.com' in referrer_domain:
-                    referrer_source = 'YouTube'
-                elif 'reddit.com' in referrer_domain:
-                    referrer_source = 'Reddit'
-                else:
-                    referrer_source = 'Referral'
-            except:
-                referrer_source = 'Referral'
-        
-        # Get page/section from custom data or URL
-        page = post_data.get('page') or request.path
-        action = post_data.get('action', 'pageview')
-        
-        # Get screen dimensions if available
-        screen_width = post_data.get('screen_width')
-        screen_height = post_data.get('screen_height')
-        
-        # Get session info
-        session_id = post_data.get('session_id')
-        
-        # Create enriched visit document
+                return int(float(v))
+            except Exception:
+                return None
+
+        screen_w = _to_int(body.get('screen_width'))
+        screen_h = _to_int(body.get('screen_height'))
+        clicks = _to_int(body.get('clicks')) or 0
+        scroll_depth = None
+        try:
+            if body.get('scroll_depth') is not None:
+                scroll_depth = float(body.get('scroll_depth'))
+        except Exception:
+            scroll_depth = None
+
+        geo = _geo_lookup(ip)
+
         now = datetime.datetime.utcnow()
-        
-        new_visit = {
-            # Basic request data
-            **post_data,
-            
-            # Analytics metadata
-            'analytics': {
-                'session_id': session_id,
-                'page': page,
-                'action': action,
-                'timestamp': now.isoformat(),
-                'date': now.strftime("%Y-%m-%d"),
-                'time': now.strftime("%H:%M:%S"),
-                'day_of_week': now.strftime("%A"),
-                'hour': now.hour,
-                'month': now.strftime("%B"),
-                'year': now.year,
-            },
-            
-            # Visitor information
-            'visitor': {
-                'ip_address': ip_address,
-                'device': {
-                    'type': device_type,
-                    'browser': browser,
-                    'operating_system': os,
-                    'user_agent': user_agent[:200] if user_agent else None,  # Truncate if too long
-                    'screen_width': screen_width,
-                    'screen_height': screen_height,
-                },
-                'language': headers.get('Accept-Language', '').split(',')[0] if headers.get('Accept-Language') else None,
-            },
-            
-            # Traffic source
-            'traffic_source': {
+
+        visit_doc = {
+            'schema_version': 2,
+            'received_at': now,
+            'client': {
+                'ip_hash': hashed_ip,
+                'ip_geo': geo,
+                'language': (headers.get('Accept-Language') or '').split(',')[0] if headers.get('Accept-Language') else None,
                 'referrer': referrer,
-                'referrer_domain': referrer_domain,
-                'source': referrer_source,
-                'utm_source': request.args.get('utm_source'),
-                'utm_medium': request.args.get('utm_medium'),
-                'utm_campaign': request.args.get('utm_campaign'),
-                'utm_content': request.args.get('utm_content'),
-                'utm_term': request.args.get('utm_term'),
+                'referrer_domain': ref_domain,
+                'user_agent': ua_data,
+                'client_hints': client_hints,
             },
-            
-            # Engagement metrics (you can update these later)
-            'engagement': {
-                'time_on_page': post_data.get('time_on_page'),
-                'scroll_depth': post_data.get('scroll_depth'),
-                'clicks': post_data.get('clicks', 0),
-                'is_bounce': True,  # Default to bounce, update if subsequent actions
-                'first_visit': True,  # You'd track this via cookies/sessions
-            },
-            
-            # Request metadata
-            'request_metadata': {
-                'method': request.method,
+            'analytics': {
+                'session_id': body.get('session_id'),
+                'visitor_id': body.get('visitor_id'),
+                'page': body.get('page') or request.path,
                 'url': request.url,
                 'path': request.path,
-                'query_params': dict(request.args),
-                'content_type': request.content_type,
-                'content_length': request.content_length,
-                'is_secure': request.is_secure,
-                'headers_summary': {
-                    'user_agent': bool(user_agent),
-                    'accept_encoding': headers.get('Accept-Encoding'),
-                    'accept_language': headers.get('Accept-Language'),
-                    'connection': headers.get('Connection'),
-                    'cache_control': headers.get('Cache-Control'),
-                }
+                'event': event,
+                'utm': utm,
+                'timestamp': now,
+                'date': now.strftime("%Y-%m-%d"),
+                'hour': now.hour,
             },
-            
-            # System timestamps
-            'timestamp': now,
-            'server_timestamp': now.isoformat(),
+            'engagement': {
+                'screen_width': screen_w,
+                'screen_height': screen_h,
+                'clicks': clicks,
+                'scroll_depth': scroll_depth,
+                'is_bounce': bool(body.get('is_bounce', True)),
+                'performance': perf,
+            },
+            'metadata': {
+                'sample_rate': float(os.getenv('VISIT_SAMPLE_RATE', '1.0')),
+                'sampled': False,
+                'source_ip_raw_stored': False,
+            }
         }
-        
-        # Insert into MongoDB collection
-        result = visits_collection.insert_one(new_visit)
-        visit_id = str(result.inserted_id)
-        
-        # Return success response with minimal data
-        return jsonify({
-            'success': True,
-            'message': 'Visit recorded successfully',
-            'visit_id': visit_id,
-            'timestamp': now.isoformat()
-        }), 201
-        
+
+        sample_rate = float(os.getenv('VISIT_SAMPLE_RATE', '1.0'))
+        if sample_rate < 1.0 and random.random() > sample_rate:
+            visit_doc['metadata']['sampled'] = True
+            return jsonify({'success': True, 'message': 'Visit sampled'}), 202
+
+        _insert_visit_async(visit_doc)
+
+        return jsonify({'success': True, 'message': 'Visit recorded', 'received_at': now.isoformat()}), 201
+
     except Exception as e:
-        # Log the error but don't expose details to client
-        print(f"Error recording visit: {str(e)}")
-        return jsonify({
-            'success': False,
-            'message': 'Failed to record visit'
-        }), 500
+        print("Error recording visit:", str(e))
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'message': 'Failed to record visit'}), 500
+
 
 @app.route('/visits/insights', methods=['GET'])
 def get_visits_insights():
+    """Build insights compatible with the enhanced visit schema.
+    This aggregates by new field names (received_at, client.*, analytics.*, engagement.*)
+    """
     try:
-        # Get time filter from query parameters (optional)
         days_param = request.args.get('days', '7')
         try:
             days = int(days_param)
         except ValueError:
             days = 7
-        
-        # Calculate date threshold
+
         cutoff_date = datetime.datetime.utcnow() - datetime.timedelta(days=days)
-        
-        # Build insights
+
         insights = {
             'summary': {},
             'traffic_sources': {},
@@ -258,8 +336,7 @@ def get_visits_insights():
             'engagement': {},
             'timeline': {}
         }
-        
-        # Helper function to safely round
+
         def safe_round(value, decimals=2):
             if value is None:
                 return 0
@@ -267,19 +344,18 @@ def get_visits_insights():
                 return round(float(value), decimals)
             except (TypeError, ValueError):
                 return 0
-        
-        # 1. BASIC SUMMARY METRICS
+
+        # Basic summary
         total_visits = visits_collection.count_documents({})
-        recent_visits = visits_collection.count_documents({'timestamp': {'$gte': cutoff_date}})
-        
+        recent_visits = visits_collection.count_documents({'received_at': {'$gte': cutoff_date}})
+
         unique_ips_pipeline = [
-            {'$group': {'_id': '$visitor.ip_address'}},
+            {'$group': {'_id': '$client.ip_hash'}},
             {'$count': 'unique_visitors'}
         ]
         unique_ips_result = list(visits_collection.aggregate(unique_ips_pipeline))
         unique_visitors = unique_ips_result[0]['unique_visitors'] if unique_ips_result else 0
-        
-        # Get bounce rate (single page visits)
+
         bounce_pipeline = [
             {'$match': {'engagement.is_bounce': True}},
             {'$count': 'bounces'}
@@ -287,7 +363,7 @@ def get_visits_insights():
         bounce_result = list(visits_collection.aggregate(bounce_pipeline))
         bounces = bounce_result[0]['bounces'] if bounce_result else 0
         bounce_rate = (bounces / total_visits * 100) if total_visits > 0 else 0
-        
+
         insights['summary'] = {
             'total_visits': total_visits,
             'recent_visits': recent_visits,
@@ -295,92 +371,87 @@ def get_visits_insights():
             'avg_visits_per_day': safe_round(recent_visits / days if days > 0 else 0),
             'bounce_rate': safe_round(bounce_rate)
         }
-        
-        # 2. TRAFFIC SOURCES
+
+        # Traffic sources (by referrer domain / UTM source)
         traffic_pipeline = [
             {'$group': {
-                '_id': '$traffic_source.source',
+                '_id': '$client.referrer_domain',
                 'count': {'$sum': 1},
-                'avg_time': {'$avg': '$engagement.time_on_page'}
+                'avg_time': {'$avg': '$engagement.performance.page_load_time'}
             }},
             {'$sort': {'count': -1}},
             {'$limit': 10}
         ]
-        
         traffic_results = list(visits_collection.aggregate(traffic_pipeline))
         insights['traffic_sources'] = {
-            'by_source': [
+            'by_referrer_domain': [
                 {
-                    'source': item['_id'] or 'Unknown',
+                    'referrer_domain': item['_id'] or 'Direct',
                     'count': item['count'],
-                    'avg_time': safe_round(item['avg_time'])
+                    'avg_page_load_time': safe_round(item['avg_time'])
                 }
                 for item in traffic_results
             ],
-            'top_referrers': list(visits_collection.find(
-                {'traffic_source.referrer_domain': {'$ne': None}},
-                {'traffic_source.referrer_domain': 1, '_id': 0}
-            ).distinct('traffic_source.referrer_domain')[:10])
+            'by_utm_source': [
+                {
+                    'utm_source': group['_id'] or 'Unknown',
+                    'count': group['count']
+                }
+                for group in list(visits_collection.aggregate([
+                    {'$group': {'_id': '$analytics.utm.utm_source', 'count': {'$sum': 1}}},
+                    {'$sort': {'count': -1}},
+                    {'$limit': 10}
+                ]))
+            ]
         }
-        
-        # 3. DEVICE & BROWSER INSIGHTS
+
+        # Device & browser insights
         device_pipeline = [
             {'$group': {
-                '_id': '$visitor.device.type',
-                'count': {'$sum': 1},
-                'percentage': {'$avg': 1}
+                '_id': '$client.user_agent.device_family',
+                'count': {'$sum': 1}
             }},
             {'$sort': {'count': -1}}
         ]
-        
         device_results = list(visits_collection.aggregate(device_pipeline))
         insights['devices'] = {
-            'by_type': [
-                {
-                    'device': item['_id'] or 'Unknown',
-                    'count': item['count'],
-                    'percentage': safe_round((item.get('percentage') or 0) * 100)
-                }
-                for item in device_results
+            'by_device_family': [
+                {'device': item['_id'] or 'Unknown', 'count': item['count']} for item in device_results
             ],
-            'browsers': list(visits_collection.find(
-                {'visitor.device.browser': {'$ne': None, '$ne': ''}},
-                {'visitor.device.browser': 1, '_id': 0}
-            ).distinct('visitor.device.browser')[:5]),
-            'operating_systems': list(visits_collection.find(
-                {'visitor.device.operating_system': {'$ne': None, '$ne': ''}},
-                {'visitor.device.operating_system': 1, '_id': 0}
-            ).distinct('visitor.device.operating_system')[:5])
+            'top_browsers': [
+                {'browser': b, 'count': c} for b, c in list(visits_collection.aggregate([
+                    {'$group': {'_id': '$client.user_agent.browser_family', 'count': {'$sum': 1}}},
+                    {'$sort': {'count': -1}},
+                    {'$limit': 5}
+                ]))
+            ]
         }
-        
-        # 4. MOST POPULAR PAGES
+
+        # Most popular pages
         pages_pipeline = [
             {'$group': {
                 '_id': '$analytics.page',
                 'count': {'$sum': 1},
-                'avg_time': {'$avg': '$engagement.time_on_page'},
-                'bounce_rate': {
-                    '$avg': {'$cond': [{'$eq': ['$engagement.is_bounce', True]}, 1, 0]}
-                }
+                'avg_load': {'$avg': '$engagement.performance.page_load_time'},
+                'bounce_rate': {'$avg': {'$cond': [{'$eq': ['$engagement.is_bounce', True]}, 1, 0]}}
             }},
             {'$sort': {'count': -1}},
             {'$limit': 10}
         ]
-        
         pages_results = list(visits_collection.aggregate(pages_pipeline))
         insights['pages'] = {
             'most_visited': [
                 {
                     'page': item['_id'] or '/',
                     'visits': item['count'],
-                    'avg_time_seconds': safe_round(item['avg_time']),
+                    'avg_page_load_time': safe_round(item.get('avg_load')),
                     'bounce_rate_percent': safe_round((item.get('bounce_rate') or 0) * 100)
                 }
                 for item in pages_results
             ]
         }
-        
-        # 5. ENGAGEMENT METRICS
+
+        # Engagement metrics
         scroll_pipeline = [
             {'$match': {'engagement.scroll_depth': {'$exists': True, '$ne': None}}},
             {'$group': {
@@ -390,9 +461,7 @@ def get_visits_insights():
                 'scrolled_users': {'$sum': 1}
             }}
         ]
-        
         scroll_result = list(visits_collection.aggregate(scroll_pipeline))
-        
         if scroll_result:
             scroll_data = scroll_result[0]
             avg_scroll = scroll_data.get('avg_scroll_depth')
@@ -402,33 +471,31 @@ def get_visits_insights():
             avg_scroll = 0
             max_scroll = 0
             scrolled_users = 0
-        
-        # Get average time on page safely
+
         time_pipeline = [
-            {'$match': {'engagement.time_on_page': {'$exists': True, '$ne': None}}},
-            {'$group': {'_id': None, 'avg': {'$avg': '$engagement.time_on_page'}}}
+            {'$match': {'engagement.performance.page_load_time': {'$exists': True, '$ne': None}}},
+            {'$group': {'_id': None, 'avg': {'$avg': '$engagement.performance.page_load_time'}}}
         ]
-        
         time_result = list(visits_collection.aggregate(time_pipeline))
         avg_time = time_result[0]['avg'] if time_result else 0
-        
+
         insights['engagement'] = {
             'avg_scroll_depth': safe_round(avg_scroll),
-            'max_scroll_depth': safe_round(max_scroll, 0),  # No decimals for max
+            'max_scroll_depth': safe_round(max_scroll, 0),
             'users_who_scrolled': scrolled_users,
-            'total_clicks': visits_collection.count_documents({'action': 'click'}),
-            'total_downloads': visits_collection.count_documents({'action': 'download'}),
-            'avg_time_on_page': safe_round(avg_time)
+            'total_clicks': visits_collection.count_documents({'engagement.clicks': {'$gt': 0}}),
+            'total_downloads': visits_collection.count_documents({'analytics.event.type': 'download'}),
+            'avg_page_load_time': safe_round(avg_time)
         }
-        
-        # 6. TIMELINE DATA (last 30 days)
-        if days <= 30:  # Only return timeline for reasonable timeframes
+
+        # Timeline (only if days <= 30)
+        if days <= 30:
             timeline_pipeline = [
-                {'$match': {'timestamp': {'$gte': cutoff_date}}},
+                {'$match': {'received_at': {'$gte': cutoff_date}}},
                 {'$group': {
-                    '_id': {'$dateToString': {'format': '%Y-%m-%d', 'date': '$timestamp'}},
+                    '_id': {'$dateToString': {'format': '%Y-%m-%d', 'date': '$received_at'}},
                     'visits': {'$sum': 1},
-                    'unique_visitors': {'$addToSet': '$visitor.ip_address'}
+                    'unique_visitors': {'$addToSet': '$client.ip_hash'}
                 }},
                 {'$project': {
                     'date': '$_id',
@@ -437,7 +504,6 @@ def get_visits_insights():
                 }},
                 {'$sort': {'date': 1}}
             ]
-            
             timeline_results = list(visits_collection.aggregate(timeline_pipeline))
             insights['timeline'] = {
                 'daily_visits': timeline_results,
@@ -449,51 +515,41 @@ def get_visits_insights():
                 'period': f'last_{days}_days',
                 'note': 'Timeline data not available for periods longer than 30 days'
             }
-        
-        # 7. PEAK HOURS
+
+        # Peak hours
         hour_pipeline = [
             {'$match': {'analytics.hour': {'$ne': None}}},
-            {'$group': {
-                '_id': '$analytics.hour',
-                'count': {'$sum': 1}
-            }},
+            {'$group': {'_id': '$analytics.hour', 'count': {'$sum': 1}}},
             {'$sort': {'count': -1}},
             {'$limit': 5}
         ]
-        
         hour_results = list(visits_collection.aggregate(hour_pipeline))
         insights['peak_hours'] = [
-            {
-                'hour': f"{int(item['_id'])}:00" if item['_id'] is not None else "Unknown",
-                'visits': item['count']
-            }
-            for item in hour_results
+            {'hour': f"{int(item['_id'])}:00" if item['_id'] is not None else 'Unknown', 'visits': item['count']} for item in hour_results
         ]
-        
-        # 8. RECENT ACTIVITY
+
+        # Recent activity
         recent_activity = list(visits_collection.find(
             {},
             {
                 'analytics.timestamp': 1,
                 'analytics.page': 1,
-                'visitor.device.type': 1,
-                'visitor.device.browser': 1,
-                'traffic_source.source': 1,
-                'action': 1,
-                'timestamp': 1
+                'client.user_agent': 1,
+                'client.referrer_domain': 1,
+                'analytics.event': 1,
+                'engagement': 1,
+                'received_at': 1
             }
-        ).sort('timestamp', -1).limit(10))
-        
-        # Convert ObjectId to string for JSON serialization
+        ).sort('received_at', -1).limit(10))
+
         for activity in recent_activity:
             activity['_id'] = str(activity['_id'])
-            # Ensure all fields exist
             activity.setdefault('analytics', {})
-            activity.setdefault('visitor', {}).setdefault('device', {})
-            activity.setdefault('traffic_source', {})
-        
+            activity.setdefault('client', {}).setdefault('user_agent', {})
+            activity.setdefault('engagement', {})
+
         insights['recent_activity'] = recent_activity
-        
+
         return jsonify({
             'success': True,
             'insights': insights,
@@ -501,7 +557,7 @@ def get_visits_insights():
             'time_period': f'Last {days} days',
             'total_records_analyzed': total_visits
         }), 200
-        
+
     except Exception as e:
         print(f"Error generating insights: {str(e)}")
         import traceback
@@ -511,7 +567,7 @@ def get_visits_insights():
             'error': 'Failed to generate insights',
             'message': str(e)
         }), 500
-        
+
 # Decorator for route protection.
 def token_required(f):
     @wraps(f)
