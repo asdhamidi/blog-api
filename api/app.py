@@ -10,25 +10,6 @@ import random
 import jwt
 import os
 
-# New imports for enhanced visit handling
-from threading import Thread
-from user_agents import parse as parse_ua
-from urllib.parse import urlparse
-import hashlib
-
-# Optional geoip support (local MaxMind DB) and external fallback
-try:
-    import geoip2.database
-    GEOIP_READER = geoip2.database.Reader(os.getenv("GEOIP2_DB_PATH", "/usr/local/share/GeoLite2-City.mmdb"))
-except Exception:
-    GEOIP_READER = None
-
-# optional requests for external IP info lookup
-try:
-    import requests
-except Exception:
-    requests = None
-
 load_dotenv()
 
 app = Flask(__name__)
@@ -50,17 +31,516 @@ users_collection = db['users']
 codes_collection = db['codes']
 visits_collection = db['visits']
 
-# Ensure useful indexes for the enhanced schema (idempotent)
-try:
-    visits_collection.create_index([('received_at', -1)])
-    visits_collection.create_index([('analytics.page', 1)])
-    visits_collection.create_index([('client.referrer_domain', 1)])
-    visits_collection.create_index([('client.ip_geo.country', 1)])
-    visits_collection.create_index([('analytics.session_id', 1)])
-    # Example TTL: keep raw visit docs for 90 days (customize as needed)
-    # visits_collection.create_index('received_at', expireAfterSeconds=60*60*24*90)
-except Exception as e:
-    print("Could not create indexes on visits collection:", e)
+
+# Home route.
+@app.route('/')
+def home():
+    return """
+    Welcome to my Blog API!
+
+    For full documentation and usage details, please visit:
+    https://github.com/asdhamidi/blog-api/blob/main/README.md
+
+    Happy trails!
+    """
+
+@app.route('/visit', methods=['GET'])
+def add_visit():
+    try:
+        post_data = dict(request.args)  # Use query params instead of JSON
+        headers = dict(request.headers)
+        
+        # Extract meaningful information
+        user_agent = headers.get('User-Agent', '')
+        referrer = request.referrer or 'Direct'
+        ip_address = request.remote_addr
+        
+        # Parse User-Agent for device/browser info
+        device_type = 'Unknown'
+        browser = 'Unknown'
+        os = 'Unknown'
+        
+        if user_agent:
+            # Simple user agent parsing (consider using a library like user-agents for production)
+            ua_lower = user_agent.lower()
+            
+            # Device detection
+            if any(mobile in ua_lower for mobile in ['mobile', 'android', 'iphone']):
+                device_type = 'Mobile'
+            elif 'tablet' in ua_lower:
+                device_type = 'Tablet'
+            else:
+                device_type = 'Desktop'
+            
+            # Browser detection
+            if 'chrome' in ua_lower and 'edg' not in ua_lower:
+                browser = 'Chrome'
+            elif 'firefox' in ua_lower:
+                browser = 'Firefox'
+            elif 'safari' in ua_lower and 'chrome' not in ua_lower:
+                browser = 'Safari'
+            elif 'edg' in ua_lower:
+                browser = 'Edge'
+            elif 'opera' in ua_lower:
+                browser = 'Opera'
+            
+            # OS detection
+            if 'windows' in ua_lower:
+                os = 'Windows'
+            elif 'mac os' in ua_lower or 'macos' in ua_lower:
+                os = 'macOS'
+            elif 'linux' in ua_lower:
+                os = 'Linux'
+            elif 'android' in ua_lower:
+                os = 'Android'
+            elif 'ios' in ua_lower or 'iphone' in ua_lower:
+                os = 'iOS'
+        
+        # Parse referrer for source tracking
+        referrer_source = 'Direct'
+        referrer_domain = None
+        
+        if referrer and referrer != 'Direct':
+            try:
+                from urllib.parse import urlparse
+                parsed_url = urlparse(referrer)
+                referrer_domain = parsed_url.netloc
+                
+                # Common source classification
+                if any(domain in referrer_domain for domain in ['google.', 'bing.', 'yahoo.', 'duckduckgo.']):
+                    referrer_source = 'Search Engine'
+                elif 'facebook.com' in referrer_domain:
+                    referrer_source = 'Facebook'
+                elif 'twitter.com' in referrer_domain or 'x.com' in referrer_domain:
+                    referrer_source = 'Twitter'
+                elif 'linkedin.com' in referrer_domain:
+                    referrer_source = 'LinkedIn'
+                elif 'github.com' in referrer_domain:
+                    referrer_source = 'GitHub'
+                elif 'youtube.com' in referrer_domain:
+                    referrer_source = 'YouTube'
+                elif 'reddit.com' in referrer_domain:
+                    referrer_source = 'Reddit'
+                else:
+                    referrer_source = 'Referral'
+            except:
+                referrer_source = 'Referral'
+        
+        # Get page/section from custom data or URL
+        page = post_data.get('page') or request.path
+        action = post_data.get('action', 'pageview')
+        
+        # Get screen dimensions if available
+        screen_width = post_data.get('screen_width')
+        screen_height = post_data.get('screen_height')
+        
+        # Get session info
+        session_id = post_data.get('session_id')
+        
+        # Create enriched visit document
+        now = datetime.datetime.utcnow()
+        
+        new_visit = {
+            # Basic request data
+            **post_data,
+            
+            # Analytics metadata
+            'analytics': {
+                'session_id': session_id,
+                'page': page,
+                'action': action,
+                'timestamp': now.isoformat(),
+                'date': now.strftime("%Y-%m-%d"),
+                'time': now.strftime("%H:%M:%S"),
+                'day_of_week': now.strftime("%A"),
+                'hour': now.hour,
+                'month': now.strftime("%B"),
+                'year': now.year,
+            },
+            
+            # Visitor information
+            'visitor': {
+                'ip_address': ip_address,
+                'device': {
+                    'type': device_type,
+                    'browser': browser,
+                    'operating_system': os,
+                    'user_agent': user_agent[:200] if user_agent else None,  # Truncate if too long
+                    'screen_width': screen_width,
+                    'screen_height': screen_height,
+                },
+                'language': headers.get('Accept-Language', '').split(',')[0] if headers.get('Accept-Language') else None,
+            },
+            
+            # Traffic source
+            'traffic_source': {
+                'referrer': referrer,
+                'referrer_domain': referrer_domain,
+                'source': referrer_source,
+                'utm_source': request.args.get('utm_source'),
+                'utm_medium': request.args.get('utm_medium'),
+                'utm_campaign': request.args.get('utm_campaign'),
+                'utm_content': request.args.get('utm_content'),
+                'utm_term': request.args.get('utm_term'),
+            },
+            
+            # Engagement metrics (you can update these later)
+            'engagement': {
+                'time_on_page': post_data.get('time_on_page'),
+                'scroll_depth': post_data.get('scroll_depth'),
+                'clicks': post_data.get('clicks', 0),
+                'is_bounce': True,  # Default to bounce, update if subsequent actions
+                'first_visit': True,  # You'd track this via cookies/sessions
+            },
+            
+            # Request metadata
+            'request_metadata': {
+                'method': request.method,
+                'url': request.url,
+                'path': request.path,
+                'query_params': dict(request.args),
+                'content_type': request.content_type,
+                'content_length': request.content_length,
+                'is_secure': request.is_secure,
+                'headers_summary': {
+                    'user_agent': bool(user_agent),
+                    'accept_encoding': headers.get('Accept-Encoding'),
+                    'accept_language': headers.get('Accept-Language'),
+                    'connection': headers.get('Connection'),
+                    'cache_control': headers.get('Cache-Control'),
+                }
+            },
+            
+            # System timestamps
+            'timestamp': now,
+            'server_timestamp': now.isoformat(),
+        }
+        
+        # Insert into MongoDB collection
+        result = visits_collection.insert_one(new_visit)
+        visit_id = str(result.inserted_id)
+        
+        # Return success response with minimal data
+        return jsonify({
+            'success': True,
+            'message': 'Visit recorded successfully',
+            'visit_id': visit_id,
+            'timestamp': now.isoformat()
+        }), 201
+        
+    except Exception as e:
+        # Log the error but don't expose details to client
+        print(f"Error recording visit: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to record visit'
+        }), 500
+
+@app.route('/visits/insights', methods=['GET'])
+def get_visits_insights():
+    try:
+        # Get time filter from query parameters (optional)
+        days_param = request.args.get('days', '7')
+        try:
+            days = int(days_param)
+        except ValueError:
+            days = 7
+        
+        # Calculate date threshold
+        cutoff_date = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+        
+        # Build insights
+        insights = {
+            'summary': {},
+            'traffic_sources': {},
+            'devices': {},
+            'pages': {},
+            'engagement': {},
+            'timeline': {}
+        }
+        
+        # Helper function to safely round
+        def safe_round(value, decimals=2):
+            if value is None:
+                return 0
+            try:
+                return round(float(value), decimals)
+            except (TypeError, ValueError):
+                return 0
+        
+        # 1. BASIC SUMMARY METRICS
+        total_visits = visits_collection.count_documents({})
+        recent_visits = visits_collection.count_documents({'timestamp': {'$gte': cutoff_date}})
+        
+        unique_ips_pipeline = [
+            {'$group': {'_id': '$visitor.ip_address'}},
+            {'$count': 'unique_visitors'}
+        ]
+        unique_ips_result = list(visits_collection.aggregate(unique_ips_pipeline))
+        unique_visitors = unique_ips_result[0]['unique_visitors'] if unique_ips_result else 0
+        
+        # Get bounce rate (single page visits)
+        bounce_pipeline = [
+            {'$match': {'engagement.is_bounce': True}},
+            {'$count': 'bounces'}
+        ]
+        bounce_result = list(visits_collection.aggregate(bounce_pipeline))
+        bounces = bounce_result[0]['bounces'] if bounce_result else 0
+        bounce_rate = (bounces / total_visits * 100) if total_visits > 0 else 0
+        
+        insights['summary'] = {
+            'total_visits': total_visits,
+            'recent_visits': recent_visits,
+            'unique_visitors': unique_visitors,
+            'avg_visits_per_day': safe_round(recent_visits / days if days > 0 else 0),
+            'bounce_rate': safe_round(bounce_rate)
+        }
+        
+        # 2. TRAFFIC SOURCES
+        traffic_pipeline = [
+            {'$group': {
+                '_id': '$traffic_source.source',
+                'count': {'$sum': 1},
+                'avg_time': {'$avg': '$engagement.time_on_page'}
+            }},
+            {'$sort': {'count': -1}},
+            {'$limit': 10}
+        ]
+        
+        traffic_results = list(visits_collection.aggregate(traffic_pipeline))
+        insights['traffic_sources'] = {
+            'by_source': [
+                {
+                    'source': item['_id'] or 'Unknown',
+                    'count': item['count'],
+                    'avg_time': safe_round(item['avg_time'])
+                }
+                for item in traffic_results
+            ],
+            'top_referrers': list(visits_collection.find(
+                {'traffic_source.referrer_domain': {'$ne': None}},
+                {'traffic_source.referrer_domain': 1, '_id': 0}
+            ).distinct('traffic_source.referrer_domain')[:10])
+        }
+        
+        # 3. DEVICE & BROWSER INSIGHTS
+        device_pipeline = [
+            {'$group': {
+                '_id': '$visitor.device.type',
+                'count': {'$sum': 1},
+                'percentage': {'$avg': 1}
+            }},
+            {'$sort': {'count': -1}}
+        ]
+        
+        device_results = list(visits_collection.aggregate(device_pipeline))
+        insights['devices'] = {
+            'by_type': [
+                {
+                    'device': item['_id'] or 'Unknown',
+                    'count': item['count'],
+                    'percentage': safe_round((item.get('percentage') or 0) * 100)
+                }
+                for item in device_results
+            ],
+            'browsers': list(visits_collection.find(
+                {'visitor.device.browser': {'$ne': None, '$ne': ''}},
+                {'visitor.device.browser': 1, '_id': 0}
+            ).distinct('visitor.device.browser')[:5]),
+            'operating_systems': list(visits_collection.find(
+                {'visitor.device.operating_system': {'$ne': None, '$ne': ''}},
+                {'visitor.device.operating_system': 1, '_id': 0}
+            ).distinct('visitor.device.operating_system')[:5])
+        }
+        
+        # 4. MOST POPULAR PAGES
+        pages_pipeline = [
+            {'$group': {
+                '_id': '$analytics.page',
+                'count': {'$sum': 1},
+                'avg_time': {'$avg': '$engagement.time_on_page'},
+                'bounce_rate': {
+                    '$avg': {'$cond': [{'$eq': ['$engagement.is_bounce', True]}, 1, 0]}
+                }
+            }},
+            {'$sort': {'count': -1}},
+            {'$limit': 10}
+        ]
+        
+        pages_results = list(visits_collection.aggregate(pages_pipeline))
+        insights['pages'] = {
+            'most_visited': [
+                {
+                    'page': item['_id'] or '/',
+                    'visits': item['count'],
+                    'avg_time_seconds': safe_round(item['avg_time']),
+                    'bounce_rate_percent': safe_round((item.get('bounce_rate') or 0) * 100)
+                }
+                for item in pages_results
+            ]
+        }
+        
+        # 5. ENGAGEMENT METRICS
+        scroll_pipeline = [
+            {'$match': {'engagement.scroll_depth': {'$exists': True, '$ne': None}}},
+            {'$group': {
+                '_id': None,
+                'avg_scroll_depth': {'$avg': '$engagement.scroll_depth'},
+                'max_scroll_depth': {'$max': '$engagement.scroll_depth'},
+                'scrolled_users': {'$sum': 1}
+            }}
+        ]
+        
+        scroll_result = list(visits_collection.aggregate(scroll_pipeline))
+        
+        if scroll_result:
+            scroll_data = scroll_result[0]
+            avg_scroll = scroll_data.get('avg_scroll_depth')
+            max_scroll = scroll_data.get('max_scroll_depth')
+            scrolled_users = scroll_data.get('scrolled_users', 0)
+        else:
+            avg_scroll = 0
+            max_scroll = 0
+            scrolled_users = 0
+        
+        # Get average time on page safely
+        time_pipeline = [
+            {'$match': {'engagement.time_on_page': {'$exists': True, '$ne': None}}},
+            {'$group': {'_id': None, 'avg': {'$avg': '$engagement.time_on_page'}}}
+        ]
+        
+        time_result = list(visits_collection.aggregate(time_pipeline))
+        avg_time = time_result[0]['avg'] if time_result else 0
+        
+        insights['engagement'] = {
+            'avg_scroll_depth': safe_round(avg_scroll),
+            'max_scroll_depth': safe_round(max_scroll, 0),  # No decimals for max
+            'users_who_scrolled': scrolled_users,
+            'total_clicks': visits_collection.count_documents({'action': 'click'}),
+            'total_downloads': visits_collection.count_documents({'action': 'download'}),
+            'avg_time_on_page': safe_round(avg_time)
+        }
+        
+        # 6. TIMELINE DATA (last 30 days)
+        if days <= 30:  # Only return timeline for reasonable timeframes
+            timeline_pipeline = [
+                {'$match': {'timestamp': {'$gte': cutoff_date}}},
+                {'$group': {
+                    '_id': {'$dateToString': {'format': '%Y-%m-%d', 'date': '$timestamp'}},
+                    'visits': {'$sum': 1},
+                    'unique_visitors': {'$addToSet': '$visitor.ip_address'}
+                }},
+                {'$project': {
+                    'date': '$_id',
+                    'visits': 1,
+                    'unique_visitors': {'$size': '$unique_visitors'}
+                }},
+                {'$sort': {'date': 1}}
+            ]
+            
+            timeline_results = list(visits_collection.aggregate(timeline_pipeline))
+            insights['timeline'] = {
+                'daily_visits': timeline_results,
+                'period': f'last_{days}_days'
+            }
+        else:
+            insights['timeline'] = {
+                'daily_visits': [],
+                'period': f'last_{days}_days',
+                'note': 'Timeline data not available for periods longer than 30 days'
+            }
+        
+        # 7. PEAK HOURS
+        hour_pipeline = [
+            {'$match': {'analytics.hour': {'$ne': None}}},
+            {'$group': {
+                '_id': '$analytics.hour',
+                'count': {'$sum': 1}
+            }},
+            {'$sort': {'count': -1}},
+            {'$limit': 5}
+        ]
+        
+        hour_results = list(visits_collection.aggregate(hour_pipeline))
+        insights['peak_hours'] = [
+            {
+                'hour': f"{int(item['_id'])}:00" if item['_id'] is not None else "Unknown",
+                'visits': item['count']
+            }
+            for item in hour_results
+        ]
+        
+        # 8. RECENT ACTIVITY
+        recent_activity = list(visits_collection.find(
+            {},
+            {
+                'analytics.timestamp': 1,
+                'analytics.page': 1,
+                'visitor.device.type': 1,
+                'visitor.device.browser': 1,
+                'traffic_source.source': 1,
+                'action': 1,
+                'timestamp': 1
+            }
+        ).sort('timestamp', -1).limit(10))
+        
+        # Convert ObjectId to string for JSON serialization
+        for activity in recent_activity:
+            activity['_id'] = str(activity['_id'])
+            # Ensure all fields exist
+            activity.setdefault('analytics', {})
+            activity.setdefault('visitor', {}).setdefault('device', {})
+            activity.setdefault('traffic_source', {})
+        
+        insights['recent_activity'] = recent_activity
+        
+        return jsonify({
+            'success': True,
+            'insights': insights,
+            'generated_at': datetime.datetime.utcnow().isoformat(),
+            'time_period': f'Last {days} days',
+            'total_records_analyzed': total_visits
+        }), 200
+        
+    except Exception as e:
+        print(f"Error generating insights: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'Failed to generate insights',
+            'message': str(e)
+        }), 500
+        
+# Decorator for route protection.
+def token_required(f):
+    @wraps(f)
+    def decorator(*args, **kwargs):
+        token = request.headers.get('Authorization')[7:]
+        if not token:
+            return jsonify({"message": "Token is missing!"}), 401
+        
+        try:
+            jwt.decode(token, jwt_secret, algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            return jsonify({"message": "Token has expired!"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"message": "Invalid token!"}), 401
+        
+        return f(*args, **kwargs)
+    return decorator
+
+
+# Authentication endpoints
+@app.route('/register', methods=['POST'])
+def register():
+    user_data = request.json
+    username = user_data.get("username")
+    password = user_data.get("password")
+    register_code = user_data.get("register_code")
+    
+    if not username or not password or not register_code:
+        return jsonify({"m    print("Could not create indexes on visits collection:", e)
 
 
 # Home route.
